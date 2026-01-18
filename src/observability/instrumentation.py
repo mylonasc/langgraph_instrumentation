@@ -8,6 +8,7 @@ import zlib
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, List, Set
 from uuid import UUID
+from collections import OrderedDict
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
@@ -19,14 +20,35 @@ from langchain_core.messages import BaseMessage
 # =============================================================================
 
 class PerfettoTracer:
-    def __init__(self):
+    """
+    Drop-in compatible tracer with a few robustness upgrades:
+      - Optional max_events cap to avoid unbounded memory growth
+      - Optional pretty JSON output toggle
+      - Adds process name metadata (optional; safe no-op if unused)
+    """
+
+    def __init__(self, *, max_events: int = 200_000, process_name: Optional[str] = None):
         self.trace_events: List[Dict[str, Any]] = []
         self.pid = os.getpid()
         self._lock = threading.Lock()
+        self._max_events = int(max_events) if max_events and max_events > 0 else 0
+
+        if process_name:
+            self.set_process_name(process_name)
 
     @staticmethod
     def _now_us() -> int:
         return time.perf_counter_ns() // 1000
+
+    def _append_event(self, ev: Dict[str, Any]) -> None:
+        with self._lock:
+            self.trace_events.append(ev)
+            if self._max_events and len(self.trace_events) > self._max_events:
+                # Keep the most recent events (cheap + predictable).
+                # If you prefer a ring buffer, switch trace_events to a deque.
+                overflow = len(self.trace_events) - self._max_events
+                if overflow > 0:
+                    del self.trace_events[:overflow]
 
     def add_event(
         self,
@@ -53,9 +75,7 @@ class PerfettoTracer:
             "args": args or {},
         }
         ev.update(extra_fields)
-
-        with self._lock:
-            self.trace_events.append(ev)
+        self._append_event(ev)
 
     def add_complete_event(
         self,
@@ -77,8 +97,7 @@ class PerfettoTracer:
             "tid": int(tid),
             "args": args or {},
         }
-        with self._lock:
-            self.trace_events.append(ev)
+        self._append_event(ev)
 
     def add_counter(
         self,
@@ -90,13 +109,31 @@ class PerfettoTracer:
         self.add_event(name=name, phase="C", category="metrics", ts_us=ts_us, tid=tid, args=values)
 
     def set_thread_name(self, tid: int, name: str):
-        # Track/thread naming metadata
+        # Trace Event Format metadata
         self.add_event(
             name="thread_name",
             phase="M",
             category="__metadata",
             tid=tid,
             args={"name": name},
+        )
+
+    def set_process_name(self, name: str):
+        self.add_event(
+            name="process_name",
+            phase="M",
+            category="__metadata",
+            tid=0,
+            args={"name": name},
+        )
+
+    def set_thread_sort_index(self, tid: int, sort_index: int):
+        self.add_event(
+            name="thread_sort_index",
+            phase="M",
+            category="__metadata",
+            tid=tid,
+            args={"sort_index": int(sort_index)},
         )
 
     # Flow events: start/end of a flow arrow across threads/tracks
@@ -124,11 +161,15 @@ class PerfettoTracer:
             bp="e",
         )
 
-    def save(self, filename: str):
+    def save(self, filename: str, *, pretty: bool = True):
         with self._lock:
             snapshot = list(self.trace_events)
+        os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
         with open(filename, "w") as f:
-            json.dump({"traceEvents": snapshot}, f, indent=2, default=str)
+            if pretty:
+                json.dump({"traceEvents": snapshot}, f, indent=2, default=str)
+            else:
+                json.dump({"traceEvents": snapshot}, f, default=str)
 
 
 # =============================================================================
@@ -136,14 +177,23 @@ class PerfettoTracer:
 # =============================================================================
 
 class PerfettoLogger:
+    """
+    Drop-in compatible logger with safer defaults:
+      - doesn't duplicate handlers
+      - you can pass an existing logger name
+    """
     def __init__(self, logger_name: str = "instrumentation"):
         self.logger = logging.getLogger(logger_name)
+
+        # Only add a default handler if the user hasn't configured one.
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S")
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+
+        # Avoid double-logging unless the user wants propagation.
         self.logger.propagate = False
 
     def log_step(self, phase: str, category: str, name: str, details: str = ""):
@@ -173,33 +223,59 @@ class RunInfo:
 
 class LangGraphInstrumentationHandler(BaseCallbackHandler):
     """
-    Key changes vs your original:
-      1) Tool calls get a stable *virtual tid* derived from tool_call_id, so overlapping tools render on separate tracks.
-      2) Async callback variants (aon_*) are implemented so async tool calls are traced properly.
-      3) tool_call_id is read directly from kwargs['tool_call_id'] (as you specified).
+    Drop-in replacement handler with refactors:
+      - Cycle-safe, bounded sanitizer + redaction support
+      - Optional caps for trace growth (via tracer) and message-id dedupe set
+      - Cleaner flow fix: flow spans from parent's start_ts -> child's start_ts
+      - Async-friendly: can optionally use virtual "task tids" to separate concurrent async runs
+      - Keeps your virtual tool tid behavior (tool_call_id -> deterministic tid)
     """
 
-    # Keep virtual tids away from real thread ids
     _TOOL_TID_OFFSET = 10_000_000
+    _TASK_TID_OFFSET = 20_000_000
 
-    def __init__(self, tracer: PerfettoTracer, logger: PerfettoLogger):
+    def __init__(
+        self,
+        tracer: PerfettoTracer,
+        logger: PerfettoLogger,
+        *,
+        # Sanitization controls (safe defaults)
+        sanitize_max_depth: int = 6,
+        sanitize_max_str: int = 2_000,
+        sanitize_max_items: int = 50,
+        redact_keys: Optional[Set[str]] = None,
+        # Dedup controls
+        max_seen_message_ids: int = 50_000,
+        # Async lane separation
+        use_async_task_tids: bool = True,
+    ):
         super().__init__()
         self.tracer = tracer
         self.console = logger
 
         self.run_map: Dict[str, RunInfo] = {}
-        self._run_lock = threading.Lock()  # REQUIRED
+        self._run_lock = threading.Lock()
 
         self._named_tids: Set[int] = set()
         self._named_tids_lock = threading.Lock()
 
         self._flow_lock = threading.Lock()
-        self._flow_counter = 1
+        self._flow_counter = 0  # fixed: first id will be 1
 
         self.token_counts = {"total": 0, "input": 0, "output": 0}
 
-        self.seen_message_ids: Set[str] = set()
+        # LRU-like tracking to avoid repeating large message blobs forever
+        self._seen_message_ids = OrderedDict()  # msg_key -> None
         self._msg_lock = threading.Lock()
+        self._max_seen_message_ids = int(max_seen_message_ids) if max_seen_message_ids and max_seen_message_ids > 0 else 0
+
+        # Sanitization policy
+        self._sanitize_max_depth = int(sanitize_max_depth)
+        self._sanitize_max_str = int(sanitize_max_str)
+        self._sanitize_max_items = int(sanitize_max_items)
+        self._redact_keys = {k.lower() for k in (redact_keys or {"api_key", "authorization", "token", "password", "secret"})}
+
+        self._use_async_task_tids = bool(use_async_task_tids)
 
     @staticmethod
     def _now_us() -> int:
@@ -218,31 +294,95 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         self.tracer.set_thread_name(tid, label or f"py-thread:{tid}")
 
     def _tool_virtual_tid(self, tool_call_id: str) -> int:
-        # Deterministic, stable int track id derived from tool_call_id
         h = zlib.crc32(tool_call_id.encode("utf-8")) & 0xFFFFFFFF
         return self._TOOL_TID_OFFSET + int(h)
 
-    def _extract_metadata(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        meta = kwargs.get("metadata", {}) or {}
-        keep_keys = {"thread_id", "langgraph_node", "checkpoint_id", "graph_name"}
-        return {k: meta[k] for k in keep_keys if k in meta}
+    def _task_virtual_tid(self) -> Optional[int]:
+        if not self._use_async_task_tids:
+            return None
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if not task:
+            return None
+        # Stable-ish per task during lifetime; sufficient for lane separation.
+        return self._TASK_TID_OFFSET + (id(task) & 0xFFFFFFFF)
 
-    def _sanitize_state(self, data: Any) -> Any:
-        if isinstance(data, dict):
-            new_data = {}
-            for k, v in data.items():
-                if k == "messages" and isinstance(v, list):
-                    new_data[k] = [self._process_single_message(m) for m in v]
+    def _extract_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        keep_keys = {"thread_id", "langgraph_node", "checkpoint_id", "graph_name"}
+        return {k: metadata[k] for k in keep_keys if k in metadata}
+
+    # ---------------------------
+    # Sanitization (bounded + cycle-safe + redaction)
+    # ---------------------------
+
+    def _sanitize(self, obj: Any, *, _depth: int = 0, _seen: Optional[Set[int]] = None) -> Any:
+        if _seen is None:
+            _seen = set()
+        oid = id(obj)
+        if oid in _seen:
+            return "<cycle>"
+        if _depth >= self._sanitize_max_depth:
+            return "<max_depth>"
+
+        # primitives
+        if obj is None or isinstance(obj, (bool, int, float)):
+            return obj
+        if isinstance(obj, str):
+            return obj if len(obj) <= self._sanitize_max_str else (obj[: self._sanitize_max_str] + "…<trunc>")
+        if isinstance(obj, bytes):
+            return f"<bytes:{len(obj)}>"
+
+        _seen.add(oid)
+
+        # dict-like
+        if isinstance(obj, dict):
+            out: Dict[str, Any] = {}
+            items = list(obj.items())
+            for k, v in items[: self._sanitize_max_items]:
+                ks = str(k)
+                if ks.lower() in self._redact_keys:
+                    out[ks] = "<redacted>"
                 else:
-                    new_data[k] = self._sanitize_state(v)
-            return new_data
-        if isinstance(data, list):
-            return [self._sanitize_state(x) for x in data]
-        return data
+                    out[ks] = self._sanitize(v, _depth=_depth + 1, _seen=_seen)
+            if len(items) > self._sanitize_max_items:
+                out["…"] = f"<{len(items) - self._sanitize_max_items} more keys>"
+            return out
+
+        # list/tuple/set
+        if isinstance(obj, (list, tuple, set)):
+            seq = list(obj)
+            out = [self._sanitize(x, _depth=_depth + 1, _seen=_seen) for x in seq[: self._sanitize_max_items]]
+            if len(seq) > self._sanitize_max_items:
+                out.append(f"…<{len(seq) - self._sanitize_max_items} more items>")
+            return out
+
+        # BaseMessage gets special handling to avoid enormous nested structures
+        if isinstance(obj, BaseMessage):
+            return self._process_single_message(obj)
+
+        # fallback for other objects
+        return f"<{obj.__class__.__name__}:{str(obj)[: self._sanitize_max_str]}>"
+
+    def _mark_message_seen(self, msg_key: str) -> bool:
+        """
+        Returns True if already seen, False if newly recorded.
+        LRU behavior if max cap is set.
+        """
+        with self._msg_lock:
+            if msg_key in self._seen_message_ids:
+                # refresh LRU
+                self._seen_message_ids.move_to_end(msg_key, last=True)
+                return True
+            self._seen_message_ids[msg_key] = None
+            if self._max_seen_message_ids and len(self._seen_message_ids) > self._max_seen_message_ids:
+                self._seen_message_ids.popitem(last=False)
+            return False
 
     def _process_single_message(self, message: Any) -> Any:
         if not isinstance(message, BaseMessage):
-            return str(message)
+            return self._sanitize(message)
 
         msg_id = getattr(message, "id", None)
         if msg_id is None:
@@ -258,16 +398,35 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
             if hasattr(message, f):
                 msg_data[f] = getattr(message, f)
 
+        # sanitize potentially huge / sensitive fields
+        if "content" in msg_data:
+            msg_data["content"] = self._sanitize(msg_data["content"])
+        if "additional_kwargs" in msg_data:
+            msg_data["additional_kwargs"] = self._sanitize(msg_data["additional_kwargs"])
+
         if msg_key is not None:
-            with self._msg_lock:
-                if msg_key in self.seen_message_ids:
-                    ref = {"id": msg_id}
-                    if hasattr(message, "type"):
-                        ref["type"] = getattr(message, "type")
-                    return ref
-                self.seen_message_ids.add(msg_key)
+            if self._mark_message_seen(msg_key):
+                ref = {"id": msg_id}
+                if hasattr(message, "type"):
+                    ref["type"] = getattr(message, "type")
+                return ref
 
         return msg_data
+
+    # ---------------------------
+    # Run tracking + flows
+    # ---------------------------
+
+    def _choose_tid(self, tid_override: Optional[int] = None) -> int:
+        if tid_override is not None:
+            return tid_override
+
+        # If we're in an async Task, optionally create a virtual tid lane for concurrency.
+        task_tid = self._task_virtual_tid()
+        if task_tid is not None:
+            return task_tid
+
+        return threading.get_ident()
 
     def _start_run(
         self,
@@ -276,19 +435,19 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         category: str,
         args: Optional[Dict[str, Any]],
         parent_run_id: Optional[UUID],
-        tid_override: Optional[int] = None,  # <-- NEW
+        tid_override: Optional[int] = None,
     ):
         rid = str(run_id)
         start_ts = self._now_us()
-
-        # IMPORTANT: use the override tid if provided (virtual tool tracks)
-        tid = tid_override if tid_override is not None else threading.get_ident()
+        tid = self._choose_tid(tid_override)
 
         self._ensure_thread_named(tid)
 
         parent_key = str(parent_run_id) if parent_run_id is not None else None
 
-        # Flow link parent -> child (across threads/tracks)
+        # FLOW FIX (cleanest option):
+        # Emit a flow that spans from parent.start_ts_us -> child.start_ts_us.
+        # This avoids "zero-length" flows while requiring no extra bookkeeping.
         if parent_key is not None:
             with self._run_lock:
                 parent_info = self.run_map.get(parent_key)
@@ -300,7 +459,7 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
                     "parent_run_id": parent_key,
                     "child_run_id": rid,
                 }
-                self.tracer.add_flow_start(flow_id, start_ts, parent_info.tid, flow_args)
+                self.tracer.add_flow_start(flow_id, parent_info.start_ts_us, parent_info.tid, flow_args)
                 self.tracer.add_flow_end(flow_id, start_ts, tid, flow_args)
 
         with self._run_lock:
@@ -317,7 +476,7 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         if args:
             marker = dict(args)
             marker["parent_run_id"] = parent_key
-            marker["real_tid"] = threading.get_ident()
+            marker["callback_tid"] = threading.get_ident()
             self.tracer.add_event(
                 name=name,
                 phase="i",
@@ -334,13 +493,13 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
             info = self.run_map.pop(rid, None)
 
         if info is None:
-            # still emit something visible
+            # Still emit something visible, but keep it cheap.
             ts = self._now_us()
             args = end_args or {}
             if error:
                 args = dict(args)
                 args["error"] = error
-            self.tracer.add_complete_event("Unknown", "unknown", ts, 1, threading.get_ident(), args=args)
+            self.tracer.add_complete_event("Unknown", "unknown", ts, 1, self._choose_tid(), args=args)
             return
 
         end_ts = self._now_us()
@@ -353,16 +512,20 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
             args["error"] = error
 
         args["parent_run_id"] = info.parent_run_id
-        args["real_tid_start"] = info.tid
-        args["real_tid_end"] = threading.get_ident()
+        args["start_tid"] = info.tid
+        args["end_callback_tid"] = threading.get_ident()
 
-        # IMPORTANT: end on the tid stored at start (virtual tool track works even if callback fires elsewhere)
+        # End on the stored tid so virtual tool/task lanes stay consistent even if callbacks fire elsewhere.
         self.tracer.add_complete_event(info.name, info.category, info.start_ts_us, dur, info.tid, args=args)
 
         if error:
             self.console.log_step("ERROR", info.category, info.name, error)
         else:
             self.console.log_step("END", info.category, info.name)
+
+    # ---------------------------
+    # LLM usage extraction
+    # ---------------------------
 
     def _extract_usage(self, response: LLMResult) -> Dict[str, int]:
         llm_out = getattr(response, "llm_output", None) or {}
@@ -401,41 +564,41 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         **kwargs,
     ):
         metadata = kwargs.get("metadata", {}) or {}
-
         name = kwargs.get("name") or "Chain"
         category = "chain"
+
         try:
             node_name = metadata.get("langgraph_node")
             if node_name:
                 name = f"Node: {node_name}"
                 category = "graph_node"
-                sanitized_input = self._sanitize_state(inputs)
+                sanitized_input = self._sanitize(inputs)
                 self.console.log_state(node_name, f"Input -> {str(sanitized_input)[:100]}...")
             elif "graph_name" in metadata:
                 name = f"Graph: {metadata['graph_name']}"
                 category = "graph_root"
-                sanitized_input = self._sanitize_state(inputs)
+                sanitized_input = self._sanitize(inputs)
             else:
-                sanitized_input = self._sanitize_state(inputs)
+                sanitized_input = self._sanitize(inputs)
         except Exception as e:
             sanitized_input = {"instrumentation_error": str(e)}
             self.console.log_step("ERROR", "instrumentation", "on_chain_start", str(e))
 
-        trace_args = {**self._extract_metadata(kwargs), "inputs": sanitized_input}
+        trace_args = {**self._extract_metadata(metadata), "inputs": sanitized_input}
         if parent_run_id is not None:
             trace_args["parent_run_id"] = str(parent_run_id)
 
         self._start_run(run_id, name, category, trace_args, parent_run_id)
 
     def on_chain_end(self, outputs: Dict[str, Any], *, run_id: UUID, **kwargs):
-        sanitized_output = self._sanitize_state(outputs)
+        sanitized_output = self._sanitize(outputs)
         self._end_run(run_id, end_args={"outputs": sanitized_output})
 
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs):
         self._end_run(run_id, error=str(error))
 
     # -------------------------------------------------------------------------
-    # CHAIN / NODE (async) — delegates to the same logic
+    # CHAIN / NODE (async) — delegates to sync logic
     # -------------------------------------------------------------------------
     async def aon_chain_start(
         self,
@@ -531,7 +694,7 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         self.on_llm_error(error, run_id=run_id, **kwargs)
 
     # -------------------------------------------------------------------------
-    # TOOL (sync) — NEW: tool_call_id -> virtual tid track
+    # TOOL (sync) — tool_call_id -> virtual tid track
     # -------------------------------------------------------------------------
     def on_tool_start(
         self,
@@ -546,35 +709,32 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
             parent_run_id = kwargs["parent_run_id"]
 
         tool_name = serialized.get("name") or "Unknown"
-
-        # As requested: tool_call_id is in kwargs['tool_call_id']
         tool_call_id = kwargs.get("tool_call_id")
-        virtual_tid: Optional[int] = None
 
+        virtual_tid: Optional[int] = None
         if tool_call_id:
             tool_call_id = str(tool_call_id)
             virtual_tid = self._tool_virtual_tid(tool_call_id)
-            # Name the virtual tool track nicely once
             self._ensure_thread_named(virtual_tid, f"tool:{tool_name}:{tool_call_id}")
 
         self._start_run(
             run_id,
             f"Tool: {tool_name}",
             "tool",
-            {"input": input_str, "tool_call_id": tool_call_id},
+            {"input": self._sanitize(input_str), "tool_call_id": tool_call_id},
             parent_run_id,
             tid_override=virtual_tid,
         )
 
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs):
-        safe_output = self._sanitize_state(output) if isinstance(output, (dict, list)) else str(output)
+        safe_output = self._sanitize(output)
         self._end_run(run_id, end_args={"output": safe_output})
 
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs):
         self._end_run(run_id, error=str(error))
 
     # -------------------------------------------------------------------------
-    # TOOL (async) — IMPORTANT for LangGraph async tool calls
+    # TOOL (async) — delegates to sync logic
     # -------------------------------------------------------------------------
     async def aon_tool_start(
         self,
@@ -585,7 +745,6 @@ class LangGraphInstrumentationHandler(BaseCallbackHandler):
         parent_run_id: Optional[UUID] = None,
         **kwargs,
     ):
-        # This is very lightweight; calling sync logic directly is fine.
         self.on_tool_start(serialized, input_str, run_id=run_id, parent_run_id=parent_run_id, **kwargs)
 
     async def aon_tool_end(self, output: Any, *, run_id: UUID, **kwargs):
