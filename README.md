@@ -96,6 +96,28 @@ Use `SystemClock` and `RandomIdGenerator` in production. `DeterministicClock`
 and `DeterministicIdGenerator` support repeatable tests without sleeps or random
 fixtures.
 
+## Capture Safety
+
+`CapturePolicy` controls whether instrumentation retains no payload, structural
+metadata only, bounded content, or full content. Metadata-only capture is the
+default and records sizes/types rather than prompt, response, state, or tool
+bodies.
+
+```python
+from langgraph_instrumentation import CapturePolicy, MessageProjector
+
+projector = MessageProjector(capture=CapturePolicy.metadata())
+```
+
+`Sanitizer` applies depth, string, byte, and collection bounds and safely handles
+cycles and unsupported objects. `RedactionPolicy` removes common secret fields
+case-insensitively and supports custom predicates. `MetadataProjector` controls
+which framework metadata keys are retained, while `UsageExtractor` normalizes
+common provider token-usage shapes.
+
+Full capture is explicit and may retain sensitive application data. Redaction
+still applies in full mode.
+
 ## Examples
 
 Provider-backed demonstrations live under `examples/` and are not imported by

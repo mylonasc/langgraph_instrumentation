@@ -158,7 +158,7 @@ the full API with sync and async variants.
 
 - [x] FRK-01: #2
 - [x] FRK-02: #3
-- [ ] FRK-03: #4
+- [x] FRK-03: #4
 - [ ] FRK-04: #5
 - [ ] FRK-05: #6
 - [ ] FRK-06: #7
