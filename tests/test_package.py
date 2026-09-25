@@ -1,4 +1,5 @@
 import langgraph_instrumentation
+from langgraph_instrumentation import stores
 
 
 def test_public_api_is_explicit() -> None:
@@ -10,9 +11,11 @@ def test_public_api_is_explicit() -> None:
         "DeterministicClock",
         "DeterministicIdGenerator",
         "ExecutionLane",
+        "FlushableTraceStore",
         "IdGenerator",
         "LangGraphInstrumentationHandler",
         "MessageProjector",
+        "MemoryTraceStore",
         "MetadataProjector",
         "MetricPoint",
         "PerfettoLogger",
@@ -38,3 +41,7 @@ def test_public_api_is_explicit() -> None:
         "TraceSummary",
         "UsageExtractor",
     ]
+
+
+def test_store_api_is_explicit() -> None:
+    assert stores.__all__ == ["FlushableTraceStore", "MemoryTraceStore", "TraceStore"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -662,13 +663,27 @@ def _enum_from_value[EnumType: StrEnum](
         raise ValueError(f"{field_name} must be one of: {allowed}") from error
 
 
-def _event_sort_key(event: SpanEvent) -> tuple[int, int, str]:
-    return (event.time_monotonic_ns, event.time_unix_ns, event.name)
+def _event_sort_key(event: SpanEvent) -> tuple[int, int, str, str]:
+    return (
+        event.time_monotonic_ns,
+        event.time_unix_ns,
+        event.name,
+        _canonical_json(event.to_dict()),
+    )
 
 
 def _span_sort_key(span: Span) -> tuple[int, int]:
     return (span.start_time_monotonic_ns, span.span_id.value)
 
 
-def _metric_sort_key(metric: MetricPoint) -> tuple[int, int, str]:
-    return (metric.time_monotonic_ns, metric.time_unix_ns, metric.name)
+def _metric_sort_key(metric: MetricPoint) -> tuple[int, int, str, str]:
+    return (
+        metric.time_monotonic_ns,
+        metric.time_unix_ns,
+        metric.name,
+        _canonical_json(metric.to_dict()),
+    )
+
+
+def _canonical_json(value: JSONValue) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)

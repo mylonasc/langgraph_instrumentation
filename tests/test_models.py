@@ -302,6 +302,37 @@ def test_bundle_rejects_cross_trace_records_and_duplicate_spans() -> None:
         TraceBundle(trace=bundle.trace, metrics=(foreign_metric,))
 
 
+def test_event_and_metric_ties_have_canonical_total_order() -> None:
+    trace = Trace(TraceId(1), "trace", "service", 100)
+    events = tuple(
+        SpanEvent(trace.trace_id, SpanId(1), "event", 110, 110, {"order": value})
+        for value in ("b", "a")
+    )
+    span = Span(
+        trace.trace_id,
+        SpanId(1),
+        "span",
+        SpanKind.CUSTOM,
+        100,
+        100,
+        end_time_unix_ns=120,
+        end_time_monotonic_ns=120,
+        status=SpanStatus.SUCCESS,
+        events=events,
+    )
+    metrics = tuple(
+        MetricPoint(trace.trace_id, "metric", 110, 110, {"value": 1}, attributes={"order": value})
+        for value in ("b", "a")
+    )
+
+    forward = TraceBundle(trace, (span,), metrics)
+    reverse = TraceBundle(trace, (Span.from_dict(span.to_dict()),), tuple(reversed(metrics)))
+
+    assert [event.attributes["order"] for event in forward.spans[0].events] == ["a", "b"]
+    assert [metric.attributes["order"] for metric in forward.metrics] == ["a", "b"]
+    assert forward == reverse
+
+
 def test_domain_modules_do_not_import_framework_or_backend_dependencies() -> None:
     package_root = Path(__file__).parents[1] / "src" / "langgraph_instrumentation"
     forbidden_roots = {

@@ -35,7 +35,8 @@ from .policies import (
     TokenUsage,
     UsageExtractor,
 )
-from .recorder import RecorderError, SpanProcessor, TraceRecorder, TraceStore
+from .recorder import RecorderError, SpanProcessor, TraceRecorder
+from .stores import FlushableTraceStore, MemoryTraceStore, TraceStore
 
 __all__ = [
     "Clock",
@@ -45,9 +46,11 @@ __all__ = [
     "DeterministicClock",
     "DeterministicIdGenerator",
     "ExecutionLane",
+    "FlushableTraceStore",
     "IdGenerator",
     "LangGraphInstrumentationHandler",
     "MessageProjector",
+    "MemoryTraceStore",
     "MetadataProjector",
     "MetricPoint",
     "PerfettoLogger",

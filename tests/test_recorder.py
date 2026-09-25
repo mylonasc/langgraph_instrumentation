@@ -8,11 +8,15 @@ import pytest
 from langgraph_instrumentation import (
     DeterministicClock,
     DeterministicIdGenerator,
+    MemoryTraceStore,
     RecorderError,
     Span,
     SpanEvent,
+    SpanId,
     SpanKind,
     SpanStatus,
+    Trace,
+    TraceId,
     TraceRecorder,
 )
 
@@ -20,13 +24,15 @@ from langgraph_instrumentation import (
 class FakeStore:
     def __init__(self) -> None:
         self.started: list[Span] = []
+        self.traces: list[Trace] = []
         self.events: list[SpanEvent] = []
         self.metrics = []
         self.completed: list[Span] = []
         self.flushes = 0
         self.closes = 0
 
-    def start_span(self, span):
+    def start_span(self, trace, span):
+        self.traces.append(trace)
         self.started.append(span)
 
     def record_event(self, event):
@@ -37,6 +43,18 @@ class FakeStore:
 
     def complete_span(self, span):
         self.completed.append(span)
+
+    def get_trace(self, trace_id):
+        return None
+
+    def list_traces(self, query=None):
+        return ()
+
+    def delete_trace(self, trace_id):
+        return False
+
+    def delete_traces(self, *, before_unix_ns):
+        return 0
 
     def force_flush(self, timeout=None):
         self.flushes += 1
@@ -99,6 +117,33 @@ def test_root_nested_fanout_and_parent_resolution_after_parent_end() -> None:
     assert right.execution_lane != root.execution_lane
     assert right.execution_lane is not None and right.execution_lane.sort_index == 1
     assert store.completed[0].span_id == root.span_id
+
+
+def test_recorder_creates_and_reuses_neutral_trace_metadata() -> None:
+    store = FakeStore()
+    recorder = TraceRecorder(
+        store,
+        clock=DeterministicClock(unix_time_ns=1_000, monotonic_time_ns=100),
+        id_generator=DeterministicIdGenerator(),
+        service_name="agent-service",
+        resource_attributes={"environment": "test"},
+    )
+    recorder.start_span(
+        "root",
+        "root span",
+        SpanKind.GRAPH,
+        trace_name="agent run",
+        trace_attributes={"thread.id": "thread-1"},
+    )
+    recorder.end_span("root")
+    recorder.start_span("late", "late child", SpanKind.NODE, parent_correlation_id="root")
+
+    assert len(store.traces) == 2
+    assert store.traces[0] is store.traces[1]
+    assert store.traces[0].name == "agent run"
+    assert store.traces[0].service_name == "agent-service"
+    assert store.traces[0].attributes["thread.id"] == "thread-1"
+    assert store.traces[0].resource_attributes["environment"] == "test"
 
 
 def test_events_metrics_terminal_states_and_cumulative_values() -> None:
@@ -168,21 +213,37 @@ class FailingProcessor(FakeProcessor):
         raise OSError("processor unavailable")
 
 
-def test_dependency_failures_are_nonfatal_by_default_and_strict_after_all_dispatch() -> None:
+def test_store_completion_failures_do_not_commit_or_dispatch_processors() -> None:
     good = FakeProcessor()
-    recorder = TraceRecorder(FailingStore(), processors=(FailingProcessor(), good))
+    recorder = TraceRecorder(FailingStore(), processors=(good,))
     recorder.start_span("span", "operation", SpanKind.CUSTOM)
     completed = recorder.end_span("span")
-    assert good.spans == [completed]
+    assert completed is None
+    assert good.spans == []
+    assert "span" in recorder._active
 
     strict_good = FakeProcessor()
-    strict = TraceRecorder(
-        FailingStore(), processors=(FailingProcessor(), strict_good), strict=True
-    )
+    strict = TraceRecorder(FailingStore(), processors=(strict_good,), strict=True)
     strict.start_span("span", "operation", SpanKind.CUSTOM)
     with pytest.raises(RecorderError, match="complete span"):
         strict.end_span("span")
     assert strict_good.spans == []
+
+
+def test_processor_failures_are_nonfatal_by_default_and_strict_after_all_dispatch() -> None:
+    good = FakeProcessor()
+    recorder = TraceRecorder(FakeStore(), processors=(FailingProcessor(), good))
+    recorder.start_span("span", "operation", SpanKind.CUSTOM)
+    completed = recorder.end_span("span")
+    assert completed is not None
+    assert good.spans == [completed]
+
+    strict_good = FakeProcessor()
+    strict = TraceRecorder(FakeStore(), processors=(FailingProcessor(), strict_good), strict=True)
+    strict.start_span("span", "operation", SpanKind.CUSTOM)
+    with pytest.raises(RecorderError, match="process completed span"):
+        strict.end_span("span")
+    assert len(strict_good.spans) == 1
 
 
 def test_close_abandons_children_first_and_close_and_flush_are_idempotent() -> None:
@@ -199,6 +260,119 @@ def test_close_abandons_children_first_and_close_and_flush_are_idempotent() -> N
     assert all(span.status is SpanStatus.ABANDONED for span in store.completed)
     assert store.flushes == processor.flushes == 1
     assert store.closes == processor.shutdowns == 1
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_close_retries_only_abandoned_spans_rejected_by_store(strict: bool) -> None:
+    class FailOnceMemoryStore(MemoryTraceStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failures = 1
+            self.close_calls = 0
+            self.bundle_at_close = None
+            self.trace_id = None
+
+        def start_span(self, trace, span):
+            self.trace_id = trace.trace_id
+            super().start_span(trace, span)
+
+        def complete_span(self, span):
+            if self.failures:
+                self.failures -= 1
+                raise OSError("temporary completion failure")
+            super().complete_span(span)
+
+        def close(self, timeout=None):
+            assert self.trace_id is not None
+            self.bundle_at_close = self.get_trace(self.trace_id)
+            self.close_calls += 1
+            return super().close(timeout)
+
+    store = FailOnceMemoryStore()
+    processor = FakeProcessor()
+    recorder = TraceRecorder(
+        store,
+        processors=(processor,),
+        strict=strict,
+        clock=DeterministicClock(unix_time_ns=1_000, monotonic_time_ns=100),
+        id_generator=DeterministicIdGenerator(),
+    )
+    root = recorder.start_span("root", "root", SpanKind.GRAPH)
+    child = recorder.start_span("child", "child", SpanKind.NODE, parent_correlation_id="root")
+    assert root is not None and child is not None
+
+    if strict:
+        with pytest.raises(RecorderError, match="persist abandoned spans"):
+            recorder.close()
+    else:
+        assert recorder.close() is False
+
+    assert store.close_calls == 0
+    assert list(recorder._active) == ["child"]
+    assert [span.span_id for span in processor.spans] == [root.span_id]
+
+    assert recorder.close() is True
+    assert store.close_calls == 1
+    assert store.bundle_at_close is not None
+    assert [span.span_id for span in store.bundle_at_close.spans] == [root.span_id, child.span_id]
+    assert all(span.status is SpanStatus.ABANDONED for span in store.bundle_at_close.spans)
+    assert [span.span_id for span in processor.spans] == [root.span_id, child.span_id]
+
+    assert recorder.close() is True
+    assert store.close_calls == 1
+
+
+def test_concurrent_close_callers_share_retryable_attempt_result() -> None:
+    class BlockingFailOnceStore(MemoryTraceStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.failures = 1
+            self.close_calls = 0
+
+        def complete_span(self, span):
+            if self.failures:
+                self.failures -= 1
+                self.entered.set()
+                assert self.release.wait(1)
+                raise OSError("temporary completion failure")
+            super().complete_span(span)
+
+        def close(self, timeout=None):
+            self.close_calls += 1
+            return super().close(timeout)
+
+    class TrackingRecorder(TraceRecorder):
+        def __init__(self, store) -> None:
+            super().__init__(store)
+            self.waiters = 0
+            self.waiters_lock = threading.Lock()
+            self.two_waiters = threading.Event()
+
+        def _wait_for_close(self, attempt, deadline, operation):
+            with self.waiters_lock:
+                self.waiters += 1
+                if self.waiters == 2:
+                    self.two_waiters.set()
+            return super()._wait_for_close(attempt, deadline, operation)
+
+    store = BlockingFailOnceStore()
+    recorder = TrackingRecorder(store)
+    recorder.start_span("span", "span", SpanKind.CUSTOM)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(recorder.close, 1)
+        assert store.entered.wait(1)
+        second = executor.submit(recorder.close, 1)
+        assert recorder.two_waiters.wait(1)
+        store.release.set()
+        assert first.result() is False
+        assert second.result() is False
+
+    assert store.close_calls == 0
+    assert recorder.close() is True
+    assert store.close_calls == 1
 
 
 def test_context_manager_preserves_application_exception_when_strict_close_fails() -> None:
@@ -305,11 +479,11 @@ def test_store_operations_remain_ordered_when_start_is_blocked() -> None:
             self.start_entered = threading.Event()
             self.release_start = threading.Event()
 
-        def start_span(self, span):
+        def start_span(self, trace, span):
             self.operations.append("start-enter")
             self.start_entered.set()
             assert self.release_start.wait(1)
-            super().start_span(span)
+            super().start_span(trace, span)
             self.operations.append("start-exit")
 
         def record_event(self, event):
@@ -340,7 +514,8 @@ def test_store_operations_remain_ordered_when_start_is_blocked() -> None:
     assert store.operations == ["start-enter", "start-exit", "event", "metric", "complete"]
 
 
-def test_strict_store_failures_leave_each_transition_retryable_and_atomic() -> None:
+@pytest.mark.parametrize("strict", [False, True])
+def test_store_failures_leave_each_transition_retryable_and_atomic(strict: bool) -> None:
     class FailOnceStore(FakeStore):
         def __init__(self) -> None:
             super().__init__()
@@ -351,9 +526,9 @@ def test_strict_store_failures_leave_each_transition_retryable_and_atomic() -> N
                 self.failures.remove(operation)
                 raise OSError(operation)
 
-        def start_span(self, span):
+        def start_span(self, trace, span):
             self._fail_once("start")
-            super().start_span(span)
+            super().start_span(trace, span)
 
         def record_event(self, event):
             self._fail_once("event")
@@ -368,27 +543,67 @@ def test_strict_store_failures_leave_each_transition_retryable_and_atomic() -> N
             super().complete_span(span)
 
     store = FailOnceStore()
-    recorder = TraceRecorder(store, strict=True)
-    with pytest.raises(RecorderError, match="start span"):
-        recorder.start_span("span", "span", SpanKind.CUSTOM)
+    recorder = TraceRecorder(store, strict=strict)
+
+    def rejected(call, message):
+        if strict:
+            with pytest.raises(RecorderError, match=message):
+                call()
+        else:
+            assert call() is None
+
+    rejected(lambda: recorder.start_span("span", "span", SpanKind.CUSTOM), "start span")
+    assert "span" not in recorder._active
     assert recorder.start_span("span", "span", SpanKind.CUSTOM) is not None
 
-    with pytest.raises(RecorderError, match="record event"):
-        recorder.add_event("span", "event")
+    rejected(lambda: recorder.add_event("span", "event"), "record event")
+    assert recorder._active["span"].events == []
     event = recorder.add_event("span", "event")
 
-    with pytest.raises(RecorderError, match="record metric"):
-        recorder.record_metric("span", "tokens", {"total": 1}, cumulative=True)
+    rejected(
+        lambda: recorder.record_metric("span", "tokens", {"total": 1}, cumulative=True),
+        "record metric",
+    )
+    assert recorder._metric_totals == {}
     metric = recorder.record_metric("span", "tokens", {"total": 1}, cumulative=True)
 
-    with pytest.raises(RecorderError, match="complete span"):
-        recorder.end_span("span")
+    rejected(lambda: recorder.end_span("span"), "complete span")
+    assert "span" in recorder._active
     completed = recorder.end_span("span")
 
     assert completed is not None and event is not None and metric is not None
     assert completed.events == (event,)
     assert metric.values["total"] == 1
     assert store.completed == [completed]
+
+
+def test_delayed_child_rejected_after_store_eviction_does_not_become_active() -> None:
+    store = MemoryTraceStore(max_traces=1)
+    recorder = TraceRecorder(
+        store,
+        clock=DeterministicClock(unix_time_ns=1_000, monotonic_time_ns=100),
+        id_generator=DeterministicIdGenerator(),
+    )
+    root = recorder.start_span("root", "root", SpanKind.GRAPH)
+    assert root is not None
+    recorder.end_span("root")
+
+    replacement = Trace(TraceId(99), "replacement", "test", 2_000)
+    replacement_span = Span(
+        replacement.trace_id,
+        SpanId(99),
+        "replacement",
+        SpanKind.CUSTOM,
+        2_000,
+        2_000,
+    )
+    store.start_span(replacement, replacement_span)
+
+    assert (
+        recorder.start_span("delayed", "delayed", SpanKind.NODE, parent_correlation_id="root")
+        is None
+    )
+    assert "delayed" not in recorder._active
 
 
 def test_trace_context_and_totals_are_released_after_last_active_span() -> None:
