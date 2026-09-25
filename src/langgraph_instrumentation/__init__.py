@@ -35,6 +35,7 @@ from .policies import (
     TokenUsage,
     UsageExtractor,
 )
+from .recorder import RecorderError, SpanProcessor, TraceRecorder, TraceStore
 
 __all__ = [
     "Clock",
@@ -53,11 +54,13 @@ __all__ = [
     "PerfettoTracer",
     "RandomIdGenerator",
     "RedactionPolicy",
+    "RecorderError",
     "Sanitizer",
     "Span",
     "SpanEvent",
     "SpanId",
     "SpanKind",
+    "SpanProcessor",
     "SpanStatus",
     "SystemClock",
     "TokenUsage",
@@ -65,6 +68,8 @@ __all__ = [
     "TraceBundle",
     "TraceId",
     "TraceQuery",
+    "TraceRecorder",
+    "TraceStore",
     "TraceSummary",
     "UsageExtractor",
 ]
