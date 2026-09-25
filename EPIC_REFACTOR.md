@@ -157,7 +157,7 @@ the full API with sync and async variants.
 ## GitHub Delivery Checklist
 
 - [x] FRK-01: #2
-- [ ] FRK-02: #3
+- [x] FRK-02: #3
 - [ ] FRK-03: #4
 - [ ] FRK-04: #5
 - [ ] FRK-05: #6

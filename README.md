@@ -63,6 +63,39 @@ The public API above is retained only while its behavior is characterized. The
 epic intentionally introduces a clean-break recorder/store/exporter API rather
 than permanent compatibility wrappers.
 
+## Neutral Trace Records
+
+The first refactor stage provides exporter-independent, immutable domain
+records. Trace IDs are non-zero 128-bit values and span IDs are non-zero 64-bit
+values, serialized as fixed-width lowercase hexadecimal strings.
+
+```python
+from langgraph_instrumentation import Span, SpanId, SpanKind, TraceId
+
+span = Span(
+    trace_id=TraceId(1),
+    span_id=SpanId(1),
+    name="Graph: demo",
+    kind=SpanKind.GRAPH,
+    start_time_unix_ns=1_000,
+    start_time_monotonic_ns=100,
+)
+
+payload = span.to_dict()
+restored = Span.from_dict(payload)
+assert restored == span
+```
+
+`Trace`, `Span`, `SpanEvent`, `MetricPoint`, `TraceBundle`, `TraceSummary`, and
+`TraceQuery` expose explicit `to_dict()` and `from_dict()` methods. Their output
+contains only JSON-compatible values. Attribute mappings are validated and
+deeply frozen when records are constructed, so later mutation of caller-owned
+objects cannot change a stored trace.
+
+Use `SystemClock` and `RandomIdGenerator` in production. `DeterministicClock`
+and `DeterministicIdGenerator` support repeatable tests without sleeps or random
+fixtures.
+
 ## Examples
 
 Provider-backed demonstrations live under `examples/` and are not imported by
