@@ -1,3 +1,5 @@
+"""Characterized prototype implementation retained during the staged refactor."""
+
 import json
 import time
 import threading

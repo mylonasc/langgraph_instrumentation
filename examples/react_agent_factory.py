@@ -1,46 +1,50 @@
-from typing import Annotated, List, Literal, TypedDict, Any, Callable, Optional, Union, Awaitable
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Annotated, Literal, TypedDict
+
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import BaseTool
-# from langchain_core.language_models import ChatOpenAI
-from langchain.chat_models import BaseChatModel
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+
 class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]
+
 
 # Define a type alias for the node functions (can be sync or async)
-NodeCallable = Callable[[AgentState], Union[dict, Awaitable[dict]]]
+NodeCallable = Callable[[AgentState], dict | Awaitable[dict]]
+
 
 def create_react_agent(
-    model: BaseChatModel, 
-    tools: List[BaseTool], 
+    model: BaseChatModel,
+    tools: Sequence[BaseTool],
     system_prompt: str = "",
-    preprocess: Optional[NodeCallable] = None,
-    postprocess: Optional[NodeCallable] = None,
+    preprocess: NodeCallable | None = None,
+    postprocess: NodeCallable | None = None,
 ):
     """Creates a compiled LangGraph ReAct agent with optional pre- and post-processing steps.
 
-    This factory builds a state graph that cycles between an LLM ('agent') and tool execution 
-    ('tools'). It allows for optional injection of logic before the agent starts (pre-processing) 
+    This factory builds a state graph that cycles between an LLM ('agent') and tool execution
+    ('tools'). It allows for optional injection of logic before the agent starts (pre-processing)
     and after the agent decides to stop (post-processing).
 
     Args:
         model (BaseChatModel): The LangChain chat model to use as the reasoning engine.
             Must support tool binding (.bind_tools).
         tools (List[BaseTool]): A list of tools the agent can access.
-        system_prompt (str, optional): A system prompt to prepend to the message history 
+        system_prompt (str, optional): A system prompt to prepend to the message history
             before every model call. Defaults to "".
-        preprocess (Optional[NodeCallable], optional): A function (sync or async) to run 
-            before the agent loop begins. It receives the current state and should return 
+        preprocess (Optional[NodeCallable], optional): A function (sync or async) to run
+            before the agent loop begins. It receives the current state and should return
             a dictionary of state updates. Defaults to None.
-        postprocess (Optional[NodeCallable], optional): A function (sync or async) to run 
-            after the agent has decided to stop (i.e., when no tool calls are generated), 
+        postprocess (Optional[NodeCallable], optional): A function (sync or async) to run
+            after the agent has decided to stop (i.e., when no tool calls are generated),
             but before the graph ends. Defaults to None.
 
     Returns:
-        CompiledStateGraph: A compiled LangGraph application that can be invoked or 
+        CompiledStateGraph: A compiled LangGraph application that can be invoked or
         streamed.
 
     Example:
@@ -76,14 +80,14 @@ def create_react_agent(
         ```
     """
     # 1. Bind tools
-    model_with_tools = model.bind_tools(tools)
+    model_with_tools = model.bind_tools(list(tools))
 
     # 2. Define Async Agent Node
     async def call_model(state: AgentState):
         messages = state["messages"]
         if system_prompt:
             messages = [SystemMessage(content=system_prompt)] + messages
-        
+
         response = await model_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
@@ -96,10 +100,10 @@ def create_react_agent(
 
     # 4. Build Graph
     workflow = StateGraph(AgentState)
-    
+
     workflow.add_node("call_model", call_model)
     workflow.add_node("tools", ToolNode(tools))
-    
+
     if preprocess:
         workflow.add_node("preprocess", preprocess)
     if postprocess:
@@ -113,14 +117,9 @@ def create_react_agent(
         workflow.add_edge(START, "call_model")
 
     end_destination = "postprocess" if postprocess else END
-    
+
     workflow.add_conditional_edges(
-        "call_model",
-        should_continue,
-        {
-            "tools": "tools",
-            END: end_destination
-        }
+        "call_model", should_continue, {"tools": "tools", END: end_destination}
     )
 
     workflow.add_edge("tools", "call_model")

@@ -76,3 +76,8 @@ must pass. FRK-10 must review all guides against the final architecture.
 - State which acceptance criteria are satisfied.
 - Identify deferred work explicitly instead of adding speculative compatibility
   or abstraction layers.
+- Record non-blocking deferred work in
+  [FRK-Techdept #12](https://github.com/mylonasc/langgraph_instrumentation/issues/12)
+  with its origin, impact, rationale, priority, and completion condition. Never
+  use technical debt to bypass correctness, security, data-loss,
+  public-contract, or required-test failures.

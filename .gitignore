@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty/
+build/
+dist/
+*.db
+*.sqlite
+*.sqlite3
+*_trace.json

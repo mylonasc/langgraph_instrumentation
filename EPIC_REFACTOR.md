@@ -4,6 +4,7 @@
 
 - Branch: `epic-refactor`
 - Parent GitHub issue: [#1](https://github.com/mylonasc/langgraph_instrumentation/issues/1)
+- Technical debt backlog: [FRK-Techdept #12](https://github.com/mylonasc/langgraph_instrumentation/issues/12)
 - Delivery model: clean break; no compatibility wrappers for the prototype API
 - First persistence implementations: in-memory and SQLite
 - First additional observability backend: OpenTelemetry OTLP
@@ -155,7 +156,7 @@ the full API with sync and async variants.
 
 ## GitHub Delivery Checklist
 
-- [ ] FRK-01: #2
+- [x] FRK-01: #2
 - [ ] FRK-02: #3
 - [ ] FRK-03: #4
 - [ ] FRK-04: #5
@@ -558,6 +559,12 @@ The epic is complete when all of the following work through public APIs:
 - A hosted trace viewer or trace-query service.
 - Backward-compatible wrappers for prototype classes/import paths.
 
+Out-of-scope or disproportionately complex implementation findings may be added
+to [FRK-Techdept #12](https://github.com/mylonasc/langgraph_instrumentation/issues/12).
+Deferral must include impact, rationale, priority, and a concrete completion
+condition. Correctness, security, data-loss, public-contract, and required-test
+failures cannot be deferred as technical debt.
+
 ## Issue Linking Rules
 
 - Every FRK issue must link the parent epic issue.
@@ -568,3 +575,5 @@ The epic is complete when all of the following work through public APIs:
   issue and parent epic.
 - Scope changes that alter dependency direction or public contracts require an
   update to this document and the parent epic issue.
+- Non-blocking debt discovered during implementation must be recorded in
+  FRK-Techdept #12 and linked to its originating feature or pull request.
